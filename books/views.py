@@ -3,8 +3,10 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.parsers import JSONParser
 from django.shortcuts import get_object_or_404
-from django.http import Http404
+from django.http import Http404, HttpResponse
+from django.core.files import File
 from datetime import datetime
+from PIL import Image
 
 from .models import Book, QRCode
 from .serializers import (
@@ -16,6 +18,15 @@ from .serializers import (
     GoogleBookSerializer
 )
 from .google_books_api import search_books, get_book_by_id
+from .qr_code_utils import (
+    create_enhanced_qr_code,
+    add_logo_to_qr_code,
+    optimize_qr_code_image,
+    resize_qr_code_image,
+    apply_filters_to_qr_code,
+    adjust_qr_code_brightness_contrast,
+    get_image_info
+)
 
 
 def save_google_book_to_database(book_data):
@@ -122,6 +133,10 @@ class BookViewSet(viewsets.ModelViewSet):
         """
         Retrieve QR code for a specific book.
         GET /api/books/{id}/qrcode/
+        Query parameters:
+        - format: Image format (png, jpeg, webp) - default: png
+        - size: Resize image (e.g., "300x300" or "500") - default: original
+        - quality: Image quality 1-100 (for jpeg/webp) - default: 95
         """
         book = self.get_object()
         try:
@@ -129,8 +144,119 @@ class BookViewSet(viewsets.ModelViewSet):
         except QRCode.DoesNotExist:
             qrcode = QRCode.objects.create(book=book)
         
+        # Get query parameters for image processing
+        format_param = request.query_params.get('format', 'png').upper()
+        size_param = request.query_params.get('size', None)
+        quality = int(request.query_params.get('quality', 95))
+        
+        # Process QR code image if parameters provided
+        if size_param or format_param != 'PNG':
+            if qrcode.qr_code:
+                try:
+                    img = Image.open(qrcode.qr_code.path)
+                    
+                    # Resize if requested
+                    if size_param:
+                        if 'x' in size_param:
+                            width, height = map(int, size_param.split('x'))
+                            img = resize_qr_code_image(img, (width, height), maintain_aspect=False)
+                        else:
+                            img = resize_qr_code_image(img, int(size_param), maintain_aspect=True)
+                    
+                    # Convert format and optimize
+                    buffer = optimize_qr_code_image(img, format=format_param, quality=quality)
+                    
+                    # Return processed image
+                    response = HttpResponse(buffer.getvalue(), content_type=f'image/{format_param.lower()}')
+                    response['Content-Disposition'] = f'inline; filename=qrcode_{book.id}.{format_param.lower()}'
+                    return response
+                except Exception as e:
+                    pass  # Fall back to default response
+        
         serializer = QRCodeSerializer(qrcode, context={'request': request})
         return Response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def qrcode_info(self, request, pk=None):
+        """
+        Get detailed information about a book's QR code using Pillow.
+        GET /api/books/{id}/qrcode_info/
+        """
+        book = self.get_object()
+        try:
+            qrcode = book.qrcode
+        except QRCode.DoesNotExist:
+            return Response(
+                {'error': 'QR code not found for this book'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        if not qrcode.qr_code:
+            return Response(
+                {'error': 'QR code image not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get QR code information
+        info = qrcode.get_qr_code_info()
+        
+        if info is None:
+            return Response(
+                {'error': 'Could not read QR code information'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        # Add validation info
+        validation = qrcode.validate_qr_code()
+        info['validation'] = validation
+        
+        return Response(info)
+
+    @action(detail=True, methods=['post'])
+    def regenerate_qrcode(self, request, pk=None):
+        """
+        Regenerate QR code with custom settings using Pillow processing.
+        POST /api/books/{id}/regenerate_qrcode/
+        Body (all optional):
+        {
+            "size": [500, 500],
+            "quality": 95,
+            "error_correction": "H",
+            "fill_color": "black",
+            "back_color": "white"
+        }
+        """
+        book = self.get_object()
+        try:
+            qrcode = book.qrcode
+        except QRCode.DoesNotExist:
+            qrcode = QRCode.objects.create(book=book)
+        
+        # Get parameters from request
+        size = request.data.get('size', (500, 500))
+        quality = request.data.get('quality', 95)
+        error_correction = request.data.get('error_correction', 'H')
+        fill_color = request.data.get('fill_color', 'black')
+        back_color = request.data.get('back_color', 'white')
+        
+        # Generate enhanced QR code
+        qr_data = f"book:{book.id}"
+        qr_img = create_enhanced_qr_code(
+            qr_data,
+            size=tuple(size) if isinstance(size, list) else size,
+            error_correction=error_correction,
+            fill_color=fill_color,
+            back_color=back_color
+        )
+        
+        # Save QR code
+        buffer = optimize_qr_code_image(qr_img, format='PNG', quality=quality)
+        filename = f'qrcode_{book.id}.png'
+        qrcode.qr_code.save(filename, File(buffer), save=False)
+        qrcode.save()
+        
+        serializer = QRCodeSerializer(qrcode, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['post'])
     def scan_qrcode(self, request):
